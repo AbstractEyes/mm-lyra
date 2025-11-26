@@ -33,7 +33,7 @@ from .lyra_loader import (
 # ENCODER LOADER
 # ============================================================================
 
-class EncoderLoader:
+class LyraEncoderLoader:
     """
     Load text encoder (T5, Qwen, Llama) from HuggingFace.
 
@@ -365,8 +365,9 @@ class LyraEncode:
     """
     Encode inputs through Lyra VAE.
 
-    Accepts lyra_pipe, encoder_pipe, and optional pre-computed conds.
-    Outputs reconstructed conds and latent state.
+    Handles ComfyUI SDXL conditioning format:
+    - Splits merged [B, 77, 2048] back to clip_l [768] + clip_g [1280]
+    - Re-merges outputs back to SDXL format
     """
 
     CATEGORY = "Lyra/Process"
@@ -385,13 +386,9 @@ class LyraEncode:
                 "encoder_pipe": ("ENCODER_PIPE",),
                 "prompt_positive": ("STRING", {"default": "", "multiline": True}),
                 "prompt_negative": ("STRING", {"default": "", "multiline": True}),
-                # Pre-computed conds (supersede prompts if provided)
+                # Pre-computed SDXL conds (merged format)
                 "cond_positive": ("CONDITIONING",),
                 "cond_negative": ("CONDITIONING",),
-                # Individual modality inputs (for advanced use)
-                "clip_l_cond": ("CONDITIONING",),
-                "clip_g_cond": ("CONDITIONING",),
-                "t5_cond": ("CONDITIONING",),
             }
         }
 
@@ -404,9 +401,6 @@ class LyraEncode:
             prompt_negative: str = "",
             cond_positive=None,
             cond_negative=None,
-            clip_l_cond=None,
-            clip_g_cond=None,
-            t5_cond=None,
     ) -> Tuple:
 
         model = lyra_pipe["model"]
@@ -415,49 +409,43 @@ class LyraEncode:
         seed = lyra_config["seed"]
         sample_latent = lyra_config["sample_latent"]
 
-        # Set seed for reproducibility
         generator = torch.Generator(device=device).manual_seed(seed)
 
-        # Build positive inputs
-        pos_inputs = self._build_inputs(
+        # Extract positive inputs
+        pos_inputs, pos_metadata = self._build_inputs(
             encoder_pipe=encoder_pipe,
             prompt=prompt_positive,
-            precomputed_cond=cond_positive,
-            clip_l_cond=clip_l_cond,
-            clip_g_cond=clip_g_cond,
-            t5_cond=t5_cond,
+            sdxl_cond=cond_positive,
             lyra_config=lyra_config,
             device=device
         )
 
-        # Build negative inputs
-        neg_inputs = self._build_inputs(
+        # Extract negative inputs
+        neg_inputs, neg_metadata = self._build_inputs(
             encoder_pipe=encoder_pipe,
             prompt=prompt_negative,
-            precomputed_cond=cond_negative,
-            clip_l_cond=None,  # Negatives don't use individual modality inputs
-            clip_g_cond=None,
-            t5_cond=None,
+            sdxl_cond=cond_negative,
             lyra_config=lyra_config,
             device=device
         )
+
+        if not pos_inputs:
+            raise ValueError(
+                "No positive inputs provided - need either cond_positive or prompt_positive with encoder_pipe")
 
         # Encode positive
         with torch.no_grad():
-            if pos_inputs:
-                pos_result = model(
-                    pos_inputs,
-                    target_modalities=output_modalities,
-                    generator=generator
-                )
-                # v1: 3 values, v2: 4 values
-                if len(pos_result) == 3:
-                    pos_recons, pos_mu, pos_logvar = pos_result
-                    pos_per_mod = None
-                else:
-                    pos_recons, pos_mu, pos_logvar, pos_per_mod = pos_result
+            pos_result = model(
+                pos_inputs,
+                target_modalities=output_modalities,
+                generator=generator
+            )
+
+            if len(pos_result) == 3:
+                pos_recons, pos_mu, pos_logvar = pos_result
+                pos_per_mod = None
             else:
-                raise ValueError("No positive inputs provided")
+                pos_recons, pos_mu, pos_logvar, pos_per_mod = pos_result
 
         # Encode negative
         with torch.no_grad():
@@ -472,14 +460,13 @@ class LyraEncode:
                 else:
                     neg_recons, neg_mu, neg_logvar, _ = neg_result
             else:
-                # Empty negative
                 neg_recons = {k: torch.zeros_like(v) for k, v in pos_recons.items()}
                 neg_mu = torch.zeros_like(pos_mu)
                 neg_logvar = torch.zeros_like(pos_logvar)
 
-        # Build output conds (on CPU for transport)
-        cond_pos_out = self._build_output_cond(pos_recons, output_modalities)
-        cond_neg_out = self._build_output_cond(neg_recons, output_modalities)
+        # Build output conds (re-merged to SDXL format, on CPU)
+        cond_pos_out = self._build_output_cond(pos_recons, output_modalities, pos_metadata)
+        cond_neg_out = self._build_output_cond(neg_recons, output_modalities, neg_metadata)
 
         # Build latent output
         latent = {
@@ -488,7 +475,7 @@ class LyraEncode:
             "sampled": sample_latent,
         }
 
-        # Build state (for downstream use)
+        # Build state
         state = {
             "pos_recons": {k: v.cpu() for k, v in pos_recons.items()},
             "neg_recons": {k: v.cpu() for k, v in neg_recons.items()},
@@ -496,6 +483,8 @@ class LyraEncode:
             "pos_logvar": pos_logvar.cpu(),
             "neg_mu": neg_mu.cpu(),
             "neg_logvar": neg_logvar.cpu(),
+            "pos_metadata": pos_metadata,
+            "neg_metadata": neg_metadata,
             "output_modalities": output_modalities,
             "config": lyra_config,
         }
@@ -506,52 +495,100 @@ class LyraEncode:
             self,
             encoder_pipe: Optional[Dict],
             prompt: str,
-            precomputed_cond,
-            clip_l_cond,
-            clip_g_cond,
-            t5_cond,
+            sdxl_cond,
             lyra_config: Dict,
             device: str
-    ) -> Dict[str, torch.Tensor]:
-        """Build input dict for Lyra from various sources."""
+    ) -> Tuple[Dict[str, torch.Tensor], Dict]:
+        """
+        Build Lyra input dict from SDXL conditioning or prompt.
+
+        Returns:
+            (inputs_dict, original_metadata)
+        """
         inputs = {}
+        metadata = {}
 
-        # Priority 1: Individual modality conds
-        if clip_l_cond is not None:
-            inputs["clip_l"] = self._extract_embedding(clip_l_cond).to(device)
-        if clip_g_cond is not None:
-            inputs["clip_g"] = self._extract_embedding(clip_g_cond).to(device)
-        if t5_cond is not None:
-            emb = self._extract_embedding(t5_cond).to(device)
-            inputs["t5_xl_l"] = emb
-            inputs["t5_xl_g"] = emb
+        # Priority 1: SDXL conditioning (split merged back to components)
+        if sdxl_cond is not None:
+            extracted = self._extract_sdxl_embeddings(sdxl_cond)
 
-        # Priority 2: Precomputed cond (assumes SDXL-style pooled)
-        if precomputed_cond is not None and not inputs:
-            emb = self._extract_embedding(precomputed_cond).to(device)
-            # Assume it's clip_l sized, could be smarter here
-            inputs["clip_l"] = emb
+            if "clip_l" in extracted:
+                inputs["clip_l"] = extracted["clip_l"].to(device)
+            if "clip_g" in extracted:
+                inputs["clip_g"] = extracted["clip_g"].to(device)
+            if "pooled_output" in extracted:
+                metadata["pooled_output"] = extracted["pooled_output"]
 
-        # Priority 3: Encode from prompt using encoder_pipe
-        if not inputs and prompt.strip() and encoder_pipe is not None:
-            inputs = self._encode_prompt(encoder_pipe, prompt, lyra_config, device)
+            # Preserve other metadata
+            if isinstance(sdxl_cond, list) and len(sdxl_cond) > 0 and len(sdxl_cond[0]) > 1:
+                for k, v in sdxl_cond[0][1].items():
+                    if k not in metadata:
+                        metadata[k] = v
 
-        return inputs
+        # Priority 2: Encode T5 from prompt
+        if prompt.strip() and encoder_pipe is not None:
+            t5_embed = self._encode_t5(encoder_pipe, prompt, device)
+            inputs["t5_xl_l"] = t5_embed
+            inputs["t5_xl_g"] = t5_embed
 
-    def _encode_prompt(
+        return inputs, metadata
+
+    def _extract_sdxl_embeddings(self, conditioning) -> Dict[str, torch.Tensor]:
+        """
+        Extract CLIP-L and CLIP-G from ComfyUI SDXL conditioning.
+
+        ComfyUI SDXL format:
+            [[merged_embed, {"pooled_output": pooled, ...}], ...]
+
+        Where merged_embed is [B, 77, 2048] = clip_l (768) + clip_g (1280)
+        """
+        if isinstance(conditioning, list) and len(conditioning) > 0:
+            merged = conditioning[0][0]  # [B, 77, 2048]
+            metadata = conditioning[0][1] if len(conditioning[0]) > 1 else {}
+        elif isinstance(conditioning, torch.Tensor):
+            merged = conditioning
+            metadata = {}
+        else:
+            raise ValueError(f"Unknown conditioning format: {type(conditioning)}")
+
+        result = {}
+
+        # Detect format based on last dimension
+        last_dim = merged.shape[-1]
+
+        if last_dim == 2048:
+            # SDXL merged format: split back
+            result["clip_l"] = merged[..., :768]  # [B, 77, 768]
+            result["clip_g"] = merged[..., 768:]  # [B, 77, 1280]
+        elif last_dim == 768:
+            # SD1.5 format: just clip_l
+            result["clip_l"] = merged
+        elif last_dim == 1280:
+            # Just clip_g somehow
+            result["clip_g"] = merged
+        else:
+            # Unknown format - pass through as clip_l
+            print(f"[LyraEncode] Warning: unexpected embedding dim {last_dim}, treating as clip_l")
+            result["clip_l"] = merged
+
+        # Preserve pooled output
+        if "pooled_output" in metadata:
+            result["pooled_output"] = metadata["pooled_output"]
+
+        return result
+
+    def _encode_t5(
             self,
             encoder_pipe: Dict,
             prompt: str,
-            lyra_config: Dict,
             device: str
-    ) -> Dict[str, torch.Tensor]:
-        """Encode prompt using the encoder_pipe."""
+    ) -> torch.Tensor:
+        """Encode prompt with T5/Qwen/Llama encoder."""
         model = encoder_pipe["model"]
         tokenizer = encoder_pipe["tokenizer"]
         encoder_type = encoder_pipe["encoder_type"]
         encoder_device = encoder_pipe["device"]
 
-        # Tokenize
         tokens = tokenizer(
             prompt,
             max_length=512,
@@ -560,72 +597,69 @@ class LyraEncode:
             return_tensors="pt"
         ).to(encoder_device)
 
-        # Encode
         with torch.no_grad():
             if encoder_type == "t5":
                 outputs = model(**tokens)
                 embedding = outputs.last_hidden_state
             else:
-                # Qwen/Llama - use hidden states
                 outputs = model(**tokens, output_hidden_states=True)
                 embedding = outputs.hidden_states[-1]
 
-        # Move to target device
-        embedding = embedding.to(device)
-
-        # For T5, we create both t5_xl_l and t5_xl_g
-        return {
-            "t5_xl_l": embedding,
-            "t5_xl_g": embedding,
-        }
-
-    def _extract_embedding(self, conditioning) -> torch.Tensor:
-        """Extract embedding tensor from ComfyUI conditioning format."""
-        if isinstance(conditioning, torch.Tensor):
-            return conditioning
-        if isinstance(conditioning, list) and len(conditioning) > 0:
-            return conditioning[0][0]
-        if isinstance(conditioning, dict) and "samples" in conditioning:
-            return conditioning["samples"]
-        raise ValueError(f"Unknown conditioning format: {type(conditioning)}")
+        return embedding.to(device)
 
     def _build_output_cond(
             self,
             recons: Dict[str, torch.Tensor],
-            modalities: List[str]
+            modalities: List[str],
+            original_metadata: Optional[Dict] = None
     ) -> List:
-        """Build ComfyUI conditioning format from reconstructions."""
-        # Concatenate requested modalities
-        tensors = []
-        for mod in modalities:
-            if mod in recons:
-                tensors.append(recons[mod].cpu())
+        """
+        Build ComfyUI SDXL conditioning from Lyra reconstructions.
 
-        if not tensors:
+        Re-merges clip_l + clip_g back to [B, 77, 2048] format.
+        """
+        clip_l = recons.get("clip_l")
+        clip_g = recons.get("clip_g")
+
+        if clip_l is not None and clip_g is not None:
+            # Re-merge for SDXL: [B, 77, 768] + [B, 77, 1280] -> [B, 77, 2048]
+            merged = torch.cat([clip_l.cpu(), clip_g.cpu()], dim=-1)
+        elif clip_l is not None:
+            merged = clip_l.cpu()
+        elif clip_g is not None:
+            merged = clip_g.cpu()
+        else:
             return []
 
-        # Use first modality as primary (ComfyUI expects single tensor)
-        primary = tensors[0]
+        # Build metadata
+        metadata = {}
 
-        # Store all in metadata
-        metadata = {
-            "lyra_modalities": modalities,
-            "lyra_all_recons": {k: v.cpu() for k, v in recons.items()},
-        }
+        # Preserve original metadata
+        if original_metadata:
+            metadata.update(original_metadata)
 
-        return [(primary, metadata)]
+        # Ensure pooled_output exists (required for SDXL)
+        if "pooled_output" not in metadata and clip_g is not None:
+            # Use first token of clip_g as pooled (approximation)
+            metadata["pooled_output"] = clip_g[:, 0, :].cpu()
+
+        # Store Lyra info
+        metadata["lyra_modalities"] = modalities
+        metadata["lyra_recons"] = {k: v.cpu() for k, v in recons.items()}
+
+        return [(merged, metadata)]
 
 
 # ============================================================================
-# LYRA ENCODE SUMMARY
+# LYRA ENCODE SUMMARY (FIXED)
 # ============================================================================
 
 class LyraEncodeSummary:
     """
     Ease-of-use Lyra encode with primary prompt + summary support.
 
-    Automatically concatenates summary with separator for T5 input,
-    while CLIP only sees the primary prompt (tags).
+    - CLIP sees: tags only (via upstream SDXL conds)
+    - T5 sees: tags + separator + summary
     """
 
     CATEGORY = "Lyra/Process"
@@ -640,25 +674,25 @@ class LyraEncodeSummary:
                 "lyra_pipe": ("LYRA_PIPE",),
                 "lyra_config": ("LYRA_CONFIG",),
                 "encoder_pipe": ("ENCODER_PIPE",),
+            },
+            "optional": {
+                # Tag prompt (for T5, and description of what CLIP should see)
                 "prompt_tags": ("STRING", {
                     "default": "masterpiece, 1girl, blue hair, school uniform",
                     "multiline": True
                 }),
-            },
-            "optional": {
+                # Summary (only T5 sees this, after separator)
                 "prompt_summary": ("STRING", {
-                    "default": "A cheerful schoolgirl with blue hair smiling warmly",
+                    "default": "",
                     "multiline": True
                 }),
                 "prompt_negative": ("STRING", {
-                    "default": "lowres, bad anatomy, bad hands",
+                    "default": "",
                     "multiline": True
                 }),
-                # Optional pre-computed CLIP conds
-                "clip_l_positive": ("CONDITIONING",),
-                "clip_g_positive": ("CONDITIONING",),
-                "clip_l_negative": ("CONDITIONING",),
-                "clip_g_negative": ("CONDITIONING",),
+                # Pre-computed SDXL conds (merged format) - these supersede tag encoding for CLIP
+                "cond_positive": ("CONDITIONING",),
+                "cond_negative": ("CONDITIONING",),
             }
         }
 
@@ -667,13 +701,11 @@ class LyraEncodeSummary:
             lyra_pipe: Dict,
             lyra_config: Dict,
             encoder_pipe: Dict,
-            prompt_tags: str,
+            prompt_tags: str = "",
             prompt_summary: str = "",
             prompt_negative: str = "",
-            clip_l_positive=None,
-            clip_g_positive=None,
-            clip_l_negative=None,
-            clip_g_negative=None,
+            cond_positive=None,
+            cond_negative=None,
     ) -> Tuple:
 
         model = lyra_pipe["model"]
@@ -686,7 +718,7 @@ class LyraEncodeSummary:
 
         generator = torch.Generator(device=device).manual_seed(seed)
 
-        # Build T5 input: tags + separator + summary (if enabled)
+        # Build T5 input: tags + separator + summary
         if prompt_summary.strip() and use_separator:
             t5_prompt_pos = f"{prompt_tags} {separator} {prompt_summary}"
         elif prompt_summary.strip():
@@ -694,35 +726,51 @@ class LyraEncodeSummary:
         else:
             t5_prompt_pos = prompt_tags
 
-        print(f"[LyraEncodeSummary] CLIP sees: {prompt_tags[:60]}...")
-        print(f"[LyraEncodeSummary] T5 sees: {t5_prompt_pos[:80]}...")
-
-        # Encode T5 inputs
-        t5_pos = self._encode_t5(encoder_pipe, t5_prompt_pos, device)
-        t5_neg = self._encode_t5(encoder_pipe, prompt_negative, device) if prompt_negative.strip() else None
+        print(f"[LyraEncodeSummary] T5 input: {t5_prompt_pos[:80]}...")
 
         # Build positive inputs
         pos_inputs = {}
+        pos_metadata = {}
 
-        # CLIP inputs (from upstream or leave empty for Lyra to handle)
-        if clip_l_positive is not None:
-            pos_inputs["clip_l"] = self._extract_embedding(clip_l_positive).to(device)
-        if clip_g_positive is not None:
-            pos_inputs["clip_g"] = self._extract_embedding(clip_g_positive).to(device)
+        # CLIP from upstream SDXL conds (if provided)
+        if cond_positive is not None:
+            extracted = self._extract_sdxl_embeddings(cond_positive)
+            if "clip_l" in extracted:
+                pos_inputs["clip_l"] = extracted["clip_l"].to(device)
+            if "clip_g" in extracted:
+                pos_inputs["clip_g"] = extracted["clip_g"].to(device)
+            if "pooled_output" in extracted:
+                pos_metadata["pooled_output"] = extracted["pooled_output"]
+            # Preserve other metadata
+            if isinstance(cond_positive, list) and len(cond_positive) > 0 and len(cond_positive[0]) > 1:
+                for k, v in cond_positive[0][1].items():
+                    if k not in pos_metadata:
+                        pos_metadata[k] = v
 
-        # T5 inputs
-        pos_inputs["t5_xl_l"] = t5_pos
-        pos_inputs["t5_xl_g"] = t5_pos
+        # T5 from prompt + summary
+        if t5_prompt_pos.strip():
+            t5_pos = self._encode_t5(encoder_pipe, t5_prompt_pos, device)
+            pos_inputs["t5_xl_l"] = t5_pos
+            pos_inputs["t5_xl_g"] = t5_pos
+
+        if not pos_inputs:
+            raise ValueError("No positive inputs - need cond_positive or prompt_tags with encoder")
 
         # Build negative inputs
         neg_inputs = {}
+        neg_metadata = {}
 
-        if clip_l_negative is not None:
-            neg_inputs["clip_l"] = self._extract_embedding(clip_l_negative).to(device)
-        if clip_g_negative is not None:
-            neg_inputs["clip_g"] = self._extract_embedding(clip_g_negative).to(device)
+        if cond_negative is not None:
+            extracted = self._extract_sdxl_embeddings(cond_negative)
+            if "clip_l" in extracted:
+                neg_inputs["clip_l"] = extracted["clip_l"].to(device)
+            if "clip_g" in extracted:
+                neg_inputs["clip_g"] = extracted["clip_g"].to(device)
+            if "pooled_output" in extracted:
+                neg_metadata["pooled_output"] = extracted["pooled_output"]
 
-        if t5_neg is not None:
+        if prompt_negative.strip():
+            t5_neg = self._encode_t5(encoder_pipe, prompt_negative, device)
             neg_inputs["t5_xl_l"] = t5_neg
             neg_inputs["t5_xl_g"] = t5_neg
 
@@ -756,9 +804,9 @@ class LyraEncodeSummary:
                 neg_mu = torch.zeros_like(pos_mu)
                 neg_logvar = torch.zeros_like(pos_logvar)
 
-        # Build outputs (CPU for transport)
-        cond_pos = self._build_output_cond(pos_recons, output_modalities)
-        cond_neg = self._build_output_cond(neg_recons, output_modalities)
+        # Build outputs (re-merged SDXL format, CPU)
+        cond_pos_out = self._build_output_cond(pos_recons, output_modalities, pos_metadata)
+        cond_neg_out = self._build_output_cond(neg_recons, output_modalities, neg_metadata)
 
         latent = {
             "mu": pos_mu.cpu(),
@@ -776,16 +824,42 @@ class LyraEncodeSummary:
             "t5_prompt_neg": prompt_negative,
             "tags_prompt": prompt_tags,
             "summary_prompt": prompt_summary,
+            "pos_metadata": pos_metadata,
+            "neg_metadata": neg_metadata,
         }
 
-        return (cond_pos, cond_neg, latent, state)
+        return (cond_pos_out, cond_neg_out, latent, state)
 
-    def _encode_t5(
-            self,
-            encoder_pipe: Dict,
-            prompt: str,
-            device: str
-    ) -> torch.Tensor:
+    def _extract_sdxl_embeddings(self, conditioning) -> Dict[str, torch.Tensor]:
+        """Extract CLIP-L and CLIP-G from ComfyUI SDXL merged conditioning."""
+        if isinstance(conditioning, list) and len(conditioning) > 0:
+            merged = conditioning[0][0]
+            metadata = conditioning[0][1] if len(conditioning[0]) > 1 else {}
+        elif isinstance(conditioning, torch.Tensor):
+            merged = conditioning
+            metadata = {}
+        else:
+            raise ValueError(f"Unknown conditioning format: {type(conditioning)}")
+
+        result = {}
+        last_dim = merged.shape[-1]
+
+        if last_dim == 2048:
+            result["clip_l"] = merged[..., :768]
+            result["clip_g"] = merged[..., 768:]
+        elif last_dim == 768:
+            result["clip_l"] = merged
+        elif last_dim == 1280:
+            result["clip_g"] = merged
+        else:
+            result["clip_l"] = merged
+
+        if "pooled_output" in metadata:
+            result["pooled_output"] = metadata["pooled_output"]
+
+        return result
+
+    def _encode_t5(self, encoder_pipe: Dict, prompt: str, device: str) -> torch.Tensor:
         """Encode prompt with T5/Qwen/Llama encoder."""
         model = encoder_pipe["model"]
         tokenizer = encoder_pipe["tokenizer"]
@@ -810,30 +884,36 @@ class LyraEncodeSummary:
 
         return embedding.to(device)
 
-    def _extract_embedding(self, conditioning) -> torch.Tensor:
-        if isinstance(conditioning, torch.Tensor):
-            return conditioning
-        if isinstance(conditioning, list) and len(conditioning) > 0:
-            return conditioning[0][0]
-        raise ValueError(f"Unknown conditioning format: {type(conditioning)}")
-
     def _build_output_cond(
             self,
             recons: Dict[str, torch.Tensor],
-            modalities: List[str]
+            modalities: List[str],
+            original_metadata: Optional[Dict] = None
     ) -> List:
-        tensors = [recons[m].cpu() for m in modalities if m in recons]
-        if not tensors:
+        """Build ComfyUI SDXL conditioning from Lyra reconstructions."""
+        clip_l = recons.get("clip_l")
+        clip_g = recons.get("clip_g")
+
+        if clip_l is not None and clip_g is not None:
+            merged = torch.cat([clip_l.cpu(), clip_g.cpu()], dim=-1)
+        elif clip_l is not None:
+            merged = clip_l.cpu()
+        elif clip_g is not None:
+            merged = clip_g.cpu()
+        else:
             return []
 
-        primary = tensors[0]
-        metadata = {
-            "lyra_modalities": modalities,
-            "lyra_all_recons": {k: v.cpu() for k, v in recons.items()},
-        }
+        metadata = {}
+        if original_metadata:
+            metadata.update(original_metadata)
 
-        return [(primary, metadata)]
+        if "pooled_output" not in metadata and clip_g is not None:
+            metadata["pooled_output"] = clip_g[:, 0, :].cpu()
 
+        metadata["lyra_modalities"] = modalities
+        metadata["lyra_recons"] = {k: v.cpu() for k, v in recons.items()}
+
+        return [(merged, metadata)]
 
 # ============================================================================
 # LYRA DECODE
@@ -931,7 +1011,7 @@ class LyraDecode:
 # ============================================================================
 
 NODE_CLASS_MAPPINGS = {
-    "EncoderLoader": EncoderLoader,
+    "LyraEncoderLoader": LyraEncoderLoader,
     "LyraLoader": LyraLoader,
     "LyraEncodeConfiguration": LyraEncodeConfiguration,
     "LyraEncode": LyraEncode,
@@ -940,7 +1020,7 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "EncoderLoader": "Encoder Loader (T5/Qwen/Llama)",
+    "LyraEncoderLoader": "Lyra Encoder Loader (T5/Qwen/Llama)",
     "LyraLoader": "Lyra Loader",
     "LyraEncodeConfiguration": "Lyra Encode Config",
     "LyraEncode": "Lyra Encode",
